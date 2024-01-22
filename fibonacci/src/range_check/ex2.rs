@@ -1,5 +1,16 @@
 use std::marker::PhantomData;
 
+
+/// This helper checks that the value witnesses in a given cell is within a given range.
+/// Depending on the rage, this helper uses either a range-check expression (for small ranges)
+/// or a lookup (for larger ranges)
+///
+///        value     |    q_range_check    |   q_lookup  |  table_value  |
+///       ----------------------------------------------------------------
+///          v_0     |         1           |      0      |       0       |
+///          v_1     |         0           |      1      |       1       |
+///
+
 use halo2_proofs::{
     arithmetic::FieldExt,
     circuit::{AssignedCell, Layouter, Value},
@@ -7,26 +18,41 @@ use halo2_proofs::{
     poly::Rotation,
 };
 
+mod table;
+
+use table::RangeCheckTable;
+
 #[derive(Debug, Clone)]
-struct RangeCheckConfig<F: FieldExt, const RANGE:usize> {
+struct RangeCheckConfig<F: FieldExt, const RANGE:usize, const LOOKUP_RANGE: usize> {
     value: Column<Advice>,
     q_range_check: Selector,
-    _marker: PhantomData<F>,
-
+    q_lookup: Selector,
+    table: RangeCheckTable<F, LOOKUP_RANGE>,
 }
 
 
-impl<F: FieldExt, const RANGE: usize> RangeCheckConfig<F, RANGE> {
+impl<F: FieldExt, const RANGE: usize, const LOOKUP_RANGE: usize> RangeCheckConfig<F, RANGE, LOOKUP_RANGE> {
     fn configure(
         meta: &mut ConstraintSystem<F>,
         value: Column<Advice>,
     ) -> Self {
         let q_range_check = meta.selector();
 
+        //toogles the q lookup; simple selectors are eleigible for optimisations
+        //simple selectos - no lookup arguments
+        // complex selectors - lookup arguments
+        //simple selectors collapses combining multiple gates and at the end they can be non binary
+        //in llokup we dont want to multiply by wired factor and only by `1`
+        let q_lookup = meta.complex_selector();
+
+        //configure a lookup table
+        let table = RangeCheckTable::configure(meta);
+
         let config = Self {
             q_range_check,
             value,
-            _marker: PhantomData
+            q_lookup,
+            table: table.clone()
         };
 
         //Range check gate
@@ -41,13 +67,23 @@ impl<F: FieldExt, const RANGE: usize> RangeCheckConfig<F, RANGE> {
             //vector of expressions at the end of create gate
             let range_check = |range: usize, value: Expression<F>| {
                 (0..range).fold(value.clone(), |expr, i| {
-                    expr * (Expression::Constant(F::from(i as u64)) -value.clone())
+                    expr * (Expression::Constant(F::from(i as u64)) - value.clone())
                 })
             };
 
             //you select one selector and with-selector multiplies each expression with 
             // the selector. so basically abstracts away the selector.
             Constraints::with_selector(q_range_check, [("range_check", range_check(RANGE, value))])
+        });
+
+        meta.lookup(|meta| {
+            let q_lookup = meta.query_selector(q_lookup);
+            let value = meta.query_advice(value, Rotation::cur());
+            
+            //lookup API returns a vedtor
+            vec![
+                (q_lookup * value.square(), table.value)
+            ]
         });
 
         config
@@ -58,18 +94,34 @@ impl<F: FieldExt, const RANGE: usize> RangeCheckConfig<F, RANGE> {
         &self,
         mut layouter: impl Layouter<F>,
         value: Value<Assigned<F>>,
+        range: usize
     ) -> Result<(), Error> {
-        layouter.assign_region(|| "Assign value", |mut region| {
-            let offset = 0;
+        assert!(range <= LOOKUP_RANGE);
 
-            //enable q range check. what is region?
-            self.q_range_check.enable(&mut region, offset);
+        if (range < RANGE ) {
+            layouter.assign_region(|| "Assign value", |mut region| {
+                let offset = 0;
+    
+                //enable q range check. what is region?
+                self.q_range_check.enable(&mut region, offset);
+    
+                //assign given value
+                region.assign_advice(|| "assign value", self.value, offset, || value)?;
+    
+                Ok(())
+            })
+        } else {
+            layouter.assign_region(|| "Assign value in lookup", |mut region| {
+                let offset = 0;
 
-            //assign given value
-            region.assign_advice(|| "assign value", self.value, offset, || value)?;
+                self.q_lookup.enable(&mut region, offset);
 
-            Ok(())
-        })
+                region.assign_advice(|| "assign value", self.value, offset, || value)?;
+
+                Ok(())
+            })
+        }
+        
     }
 
 
@@ -88,12 +140,13 @@ mod tests {
     use super::*;
 
 #[derive(Default)]
-struct MyCircuit <F: FieldExt, const RANGE: usize> {
+struct MyCircuit <F: FieldExt, const RANGE: usize, const LOOKUP_RANGE: usize> {
     value: Value<Assigned<F>>,
+    large_value: Value<Assigned<F>>,
 }
 
-    impl<F: FieldExt, const RANGE: usize> Circuit<F> for MyCircuit<F, RANGE> {
-        type Config = RangeCheckConfig<F, RANGE>;
+    impl<F: FieldExt, const RANGE: usize, const LOOKUP_RANGE: usize> Circuit<F> for MyCircuit<F, RANGE, LOOKUP_RANGE> {
+        type Config = RangeCheckConfig<F, RANGE, LOOKUP_RANGE>;
         type FloorPlanner = V1;
 
         fn without_witnesses(&self) -> Self {
@@ -110,8 +163,11 @@ struct MyCircuit <F: FieldExt, const RANGE: usize> {
             config: Self::Config,
             mut layouter: impl Layouter<F>,
         ) -> Result<(), Error> {
+
+            config.table.load(&mut layouter)?;
             // let chip =RangeCheckChip::construct(config);
-            config.assign(layouter.namespace(|| "Assign value"), self.value)?;
+            config.assign(layouter.namespace(|| "Assign value"), self.value, RANGE)?;
+            config.assign(layouter.namespace(|| "Assign large value"), self.large_value, LOOKUP_RANGE)?;
 
             Ok(())
         }
@@ -119,12 +175,16 @@ struct MyCircuit <F: FieldExt, const RANGE: usize> {
 
     #[test]
     fn test_range_check() {
-        let k = 4;
+        //k 
+        let k = 9;
         const RANGE: usize = 8;
+        const LOOKUP_RANGE: usize = 256;
 
         for i in 0..RANGE {
-            let circuit = MyCircuit::<Fp, RANGE> {
+            let circuit = MyCircuit::<Fp, RANGE, LOOKUP_RANGE> {
+                //value = v in  [v * (v-1) * (v-2) * ... * (v-(RANGE-1)) = 0]
                 value: Value::known(Fp::from(i as u64).into()),
+                large_value: Value::known(Fp::from((i*i) as u64).into()),
             };
 
             let prover = MockProver::run(k, &circuit, vec![]).unwrap();
