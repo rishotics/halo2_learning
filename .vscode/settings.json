@@ -1,0 +1,7 @@
+{
+    "rust-analyzer.linkedProjects": [
+        "./fibonacci/Cargo.toml",
+        "./fibonacci/Cargo.toml"
+    ],
+    "rust-analyzer.showUnlinkedFileNotification": false
+}

@@ -10,7 +10,9 @@ use halo2_proofs::{
     poly::Rotation,
 };
 
+mod table;
 
+use table::*
 
 pub struct DecomposeConfig<F: FieldExt, const LOOKUP_RANGE: usize> {
     running_sum: Column<Advice>,
@@ -136,7 +138,7 @@ fn compute_running_sum<F: FieldExt + PrimeFieldBits>(
     value: Assigned<F>,
     num_bits: usize,
     lookup_num_bits: usize,
-) -> Vec<Assigned<F>> {
+) -> Vec<Assigned<F>> {  
     let mut running_sum = vec![];
     let mut z = value;
 
@@ -157,4 +159,103 @@ fn compute_running_sum<F: FieldExt + PrimeFieldBits>(
 
     assert_eq!(running_sum.len(), num_bits / LOOKUP_NUM_BITS);
     running_sum
+}
+
+
+#[cfg(test)]
+mod tests{
+    use halo2_proofs::{circuit::floor_planner::V1, dev::MockProver, pasta::Fp};
+    use rand;
+
+    use super::*;
+
+    /// #derive[Default] should only be used when the circuit is having witness
+    /// values in the input. But if some structural value like 'num_bits' is
+    /// there then it makes sense to have a custom constructor
+
+    struct MyCircuit<F:FieldExt, const  NUM_BITS: usize, const RANGE: usize> {
+        value: Value<Assigned<F>>,
+        num_bits: usize,
+    }
+    
+
+    impl<F: FieldExtm + PrimeFieldBits, const NUM_BITS: usize, const RANGE: usize>
+         Circuit<F> for MyCircuit<F, NUM_BITS, RANGE> 
+    {
+
+        type Config = DecomposeConfig<F, NUM_BITS, RANGE>;
+        ///Halo2 has two floor planners
+        /// simple floor planner: single pass floor planner, it lays out regions as you go one
+        /// V1: dual pass floor planner, onece to select region shapes and sencond time to slide thoseregions around
+        /// 
+
+        type FloorPlanner = V1;
+
+        /// Why we have without_witnesses()?
+        /// we use the circuit with out witness in the first pass of the layouter
+        /// only shapes are relevant at that time not the witness values
+
+        fn without_witnesses(&self) -> Self {
+            Self {
+                value: None,
+                num_bits: self.num_bits, //in default it will be zero
+            }
+        }
+
+        fn configure(meta: &mut ConstraintSystem<F>) -> Self::Config {
+            DecomposeConfig::configure(meta)
+        }
+
+        ///what to do with the values in the circuit
+        fn synthesize(
+            &self,
+            config: Self::Config,
+            mut layouter: impl Layouter<F>,
+        ) -> Result<(), Error> {
+            config.table.load(&mut layouter)?;
+
+            let value = layouter.assign_region(
+                || "witness value",
+                |mut region| {
+                    region.assign_advice(
+                        || "witness value",
+                        config.running_sum,
+                        0,
+                        self.value
+                    )
+                }
+            )
+
+            config.assign(
+                layouter.namespace(|| "decompose"),
+                value,
+                self.num_bits,
+            )?;
+
+            Ok(())
+        }
+
+        
+    }
+}
+
+
+#[test]
+
+fn test_decompose_1() {
+    let k = 9;
+    const NUM_BITS: usize = 8;
+    const RANGE: usize = 256; // 8-bit value
+
+    // Random u64 value
+    let value: u64 = rand::random();
+    let value = Value::known(Assigned::from(Fp::from(value)));
+
+    let circuit = MyCircuit::<Fp, NUM_BITS, RANGE> {
+        value,
+        num_bits: 64,
+    };
+
+    let prover = MockProver::run(k, &circuit, vec![]).unwrap();
+    prover.assert_satisfied();
 }
